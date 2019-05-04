@@ -24,21 +24,24 @@ import (
 	"github.com/txthinking/socks5"
 )
 
-// Server.
-type Server struct {
-	Password     []byte
-	TCPAddr      *net.TCPAddr
-	UDPAddr      *net.UDPAddr
-	TCPListen    *net.TCPListener
-	UDPConn      *net.UDPConn
-	UDPExchanges *cache.Cache
-	TCPDeadline  int
-	TCPTimeout   int
-	UDPDeadline  int
+// Tunnel.
+type Tunnel struct {
+	TCPAddr       *net.TCPAddr
+	UDPAddr       *net.UDPAddr
+	ToAddr        string
+	RemoteTCPAddr *net.TCPAddr
+	RemoteUDPAddr *net.UDPAddr
+	Password      []byte
+	TCPListen     *net.TCPListener
+	UDPConn       *net.UDPConn
+	UDPExchanges  *cache.Cache
+	TCPDeadline   int
+	TCPTimeout    int
+	UDPDeadline   int
 }
 
-// NewServer.
-func NewServer(addr, password string, tcpTimeout, tcpDeadline, udpDeadline int) (*Server, error) {
+// NewTunnel.
+func NewTunnel(addr, to, remote, password string, tcpTimeout, tcpDeadline, udpDeadline int) (*Tunnel, error) {
 	taddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -47,21 +50,32 @@ func NewServer(addr, password string, tcpTimeout, tcpDeadline, udpDeadline int) 
 	if err != nil {
 		return nil, err
 	}
+	rtaddr, err := net.ResolveTCPAddr("tcp", remote)
+	if err != nil {
+		return nil, err
+	}
+	ruaddr, err := net.ResolveUDPAddr("udp", remote)
+	if err != nil {
+		return nil, err
+	}
 	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
-	s := &Server{
-		Password:     []byte(password),
-		TCPAddr:      taddr,
-		UDPAddr:      uaddr,
-		UDPExchanges: cs,
-		TCPTimeout:   tcpTimeout,
-		TCPDeadline:  tcpDeadline,
-		UDPDeadline:  udpDeadline,
+	s := &Tunnel{
+		ToAddr:        to,
+		Password:      []byte(password),
+		TCPAddr:       taddr,
+		UDPAddr:       uaddr,
+		RemoteTCPAddr: rtaddr,
+		RemoteUDPAddr: ruaddr,
+		UDPExchanges:  cs,
+		TCPTimeout:    tcpTimeout,
+		TCPDeadline:   tcpDeadline,
+		UDPDeadline:   udpDeadline,
 	}
 	return s, nil
 }
 
 // Run server.
-func (s *Server) ListenAndServe() error {
+func (s *Tunnel) ListenAndServe() error {
 	errch := make(chan error)
 	go func() {
 		errch <- s.RunTCPServer()
@@ -73,7 +87,7 @@ func (s *Server) ListenAndServe() error {
 }
 
 // RunTCPServer starts tcp server.
-func (s *Server) RunTCPServer() error {
+func (s *Tunnel) RunTCPServer() error {
 	var err error
 	s.TCPListen, err = net.ListenTCP("tcp", s.TCPAddr)
 	if err != nil {
@@ -108,7 +122,7 @@ func (s *Server) RunTCPServer() error {
 }
 
 // RunUDPServer starts udp server.
-func (s *Server) RunUDPServer() error {
+func (s *Tunnel) RunUDPServer() error {
 	var err error
 	s.UDPConn, err = net.ListenUDP("udp", s.UDPAddr)
 	if err != nil {
@@ -131,26 +145,24 @@ func (s *Server) RunUDPServer() error {
 	return nil
 }
 
+// Shutdown server.
+func (s *Tunnel) Shutdown() error {
+	var err, err1 error
+	if s.TCPListen != nil {
+		err = s.TCPListen.Close()
+	}
+	if s.UDPConn != nil {
+		err1 = s.UDPConn.Close()
+	}
+	if err != nil {
+		return err
+	}
+	return err1
+}
+
 // TCPHandle handles request.
-func (s *Server) TCPHandle(c *net.TCPConn) error {
-	cn := make([]byte, 12)
-	if _, err := io.ReadFull(c, cn); err != nil {
-		return err
-	}
-	ck, err := GetKey(s.Password, cn)
-	if err != nil {
-		return err
-	}
-	var b []byte
-	b, cn, err = ReadFrom(c, ck, cn, true)
-	if err != nil {
-		return err
-	}
-	address := socks5.ToAddress(b[0], b[1:len(b)-2], b[len(b)-2:])
-	if Debug {
-		log.Println("Dial TCP", address)
-	}
-	tmp, err := Dial.Dial("tcp", address)
+func (s *Tunnel) TCPHandle(c *net.TCPConn) error {
+	tmp, err := Dial.Dial("tcp", s.RemoteTCPAddr.String())
 	if err != nil {
 		return err
 	}
@@ -167,44 +179,67 @@ func (s *Server) TCPHandle(c *net.TCPConn) error {
 		}
 	}
 
+	k, n, err := PrepareKey(s.Password)
+	if err != nil {
+		return err
+	}
+	if _, err := rc.Write(n); err != nil {
+		return err
+	}
+
+	a, address, port, err := socks5.ParseAddress(s.ToAddr)
+	if err != nil {
+		return err
+	}
+	rawaddr := make([]byte, 0, 7)
+	rawaddr = append(rawaddr, a)
+	rawaddr = append(rawaddr, address...)
+	rawaddr = append(rawaddr, port...)
+	n, err = WriteTo(rc, rawaddr, k, n, true)
+	if err != nil {
+		return err
+	}
+
 	go func() {
-		k, n, err := PrepareKey(s.Password)
+		n := make([]byte, 12)
+		if _, err := io.ReadFull(rc, n); err != nil {
+			return
+		}
+		k, err := GetKey(s.Password, n)
 		if err != nil {
 			log.Println(err)
 			return
 		}
-		if _, err := c.Write(n); err != nil {
-			return
-		}
-		var b [1024 * 2]byte
+		var b []byte
 		for {
 			if s.TCPDeadline != 0 {
 				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
 					return
 				}
 			}
-			i, err := rc.Read(b[:])
+			b, n, err = ReadFrom(rc, k, n, false)
 			if err != nil {
 				return
 			}
-			n, err = WriteTo(c, b[0:i], k, n, false)
-			if err != nil {
+			if _, err := c.Write(b); err != nil {
 				return
 			}
 		}
 	}()
 
+	var b [1024 * 2]byte
 	for {
 		if s.TCPDeadline != 0 {
 			if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
 				return nil
 			}
 		}
-		b, cn, err = ReadFrom(c, ck, cn, false)
+		i, err := c.Read(b[:])
 		if err != nil {
 			return nil
 		}
-		if _, err := rc.Write(b); err != nil {
+		n, err = WriteTo(rc, b[0:i], k, n, false)
+		if err != nil {
 			return nil
 		}
 	}
@@ -212,13 +247,23 @@ func (s *Server) TCPHandle(c *net.TCPConn) error {
 }
 
 // UDPHandle handles packet.
-func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
-	a, h, p, data, err := Decrypt(s.Password, b)
+func (s *Tunnel) UDPHandle(addr *net.UDPAddr, b []byte) error {
+	a, address, port, err := socks5.ParseAddress(s.ToAddr)
 	if err != nil {
 		return err
 	}
+	rawaddr := make([]byte, 0, 7)
+	rawaddr = append(rawaddr, a)
+	rawaddr = append(rawaddr, address...)
+	rawaddr = append(rawaddr, port...)
+	b = append(rawaddr, b...)
+
 	send := func(ue *socks5.UDPExchange, data []byte) error {
-		_, err := ue.RemoteConn.Write(data)
+		cd, err := Encrypt(s.Password, data)
+		if err != nil {
+			return err
+		}
+		_, err = ue.RemoteConn.Write(cd)
 		if err != nil {
 			return err
 		}
@@ -229,14 +274,10 @@ func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 	iue, ok := s.UDPExchanges.Get(addr.String())
 	if ok {
 		ue = iue.(*socks5.UDPExchange)
-		return send(ue, data)
-	}
-	address := socks5.ToAddress(a, h, p)
-	if Debug {
-		log.Println("Dial UDP", address)
+		return send(ue, b)
 	}
 
-	c, err := Dial.Dial("udp", address)
+	c, err := Dial.Dial("udp", s.RemoteUDPAddr.String())
 	if err != nil {
 		return err
 	}
@@ -245,7 +286,7 @@ func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 		ClientAddr: addr,
 		RemoteConn: rc,
 	}
-	if err := send(ue, data); err != nil {
+	if err := send(ue, b); err != nil {
 		ue.RemoteConn.Close()
 		return err
 	}
@@ -266,40 +307,15 @@ func (s *Server) UDPHandle(addr *net.UDPAddr, b []byte) error {
 			if err != nil {
 				break
 			}
-			a, addr, port, err := socks5.ParseAddress(ue.ClientAddr.String())
+			_, _, _, data, err := Decrypt(s.Password, b[0:n])
 			if err != nil {
 				log.Println(err)
 				break
 			}
-			d := make([]byte, 0, 7)
-			d = append(d, a)
-			d = append(d, addr...)
-			d = append(d, port...)
-			d = append(d, b[0:n]...)
-			cd, err := Encrypt(s.Password, d)
-			if err != nil {
-				log.Println(err)
-				break
-			}
-			if _, err := s.UDPConn.WriteToUDP(cd, ue.ClientAddr); err != nil {
+			if _, err := s.UDPConn.WriteToUDP(data, ue.ClientAddr); err != nil {
 				break
 			}
 		}
 	}(ue)
 	return nil
-}
-
-// Shutdown server.
-func (s *Server) Shutdown() error {
-	var err, err1 error
-	if s.TCPListen != nil {
-		err = s.TCPListen.Close()
-	}
-	if s.UDPConn != nil {
-		err1 = s.UDPConn.Close()
-	}
-	if err != nil {
-		return err
-	}
-	return err1
 }

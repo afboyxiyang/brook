@@ -1,3 +1,17 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
@@ -9,11 +23,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/txthinking/ant"
 	"github.com/txthinking/socks5"
+	"github.com/txthinking/x"
 )
 
-// IncrementNonce loves your compute to use Litter Endian
+// IncrementNonce loves your compute to use Little Endian.
 func IncrementNonce(n []byte) []byte {
 	i := int(binary.LittleEndian.Uint16(n))
 	i += 1
@@ -22,14 +36,14 @@ func IncrementNonce(n []byte) []byte {
 	return n
 }
 
-// ReadFrom
+// ReadFrom.
 func ReadFrom(c *net.TCPConn, k, n []byte, hasTime bool) ([]byte, []byte, error) {
 	b := make([]byte, 18)
 	if _, err := io.ReadFull(c, b); err != nil {
 		return nil, nil, err
 	}
 	n = IncrementNonce(n)
-	d, err := ant.AESGCMDecrypt(b, k, n)
+	d, err := x.AESGCMDecrypt(b, k, n)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -40,7 +54,7 @@ func ReadFrom(c *net.TCPConn, k, n []byte, hasTime bool) ([]byte, []byte, error)
 		return nil, nil, err
 	}
 	n = IncrementNonce(n)
-	d, err = ant.AESGCMDecrypt(b, k, n)
+	d, err = x.AESGCMDecrypt(b, k, n)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -51,7 +65,7 @@ func ReadFrom(c *net.TCPConn, k, n []byte, hasTime bool) ([]byte, []byte, error)
 			return nil, nil, err
 		}
 		if time.Now().Unix()-int64(i) > 90 {
-			time.Sleep(time.Duration(ant.Random(1, 60*10)) * time.Second)
+			time.Sleep(time.Duration(x.Random(1, 60*10)) * time.Second)
 			return nil, nil, errors.New("Expired request")
 		}
 		d = d[10:]
@@ -59,7 +73,7 @@ func ReadFrom(c *net.TCPConn, k, n []byte, hasTime bool) ([]byte, []byte, error)
 	return d, n, nil
 }
 
-// WriteTo
+// WriteTo.
 func WriteTo(c *net.TCPConn, d, k, n []byte, needTime bool) ([]byte, error) {
 	if needTime {
 		d = append(bytes.NewBufferString(strconv.Itoa(int(time.Now().Unix()))).Bytes(), d...)
@@ -69,7 +83,7 @@ func WriteTo(c *net.TCPConn, d, k, n []byte, needTime bool) ([]byte, error) {
 	bb := make([]byte, 2)
 	binary.BigEndian.PutUint16(bb, uint16(i))
 	n = IncrementNonce(n)
-	b, err := ant.AESGCMEncrypt(bb, k, n)
+	b, err := x.AESGCMEncrypt(bb, k, n)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +92,7 @@ func WriteTo(c *net.TCPConn, d, k, n []byte, needTime bool) ([]byte, error) {
 	}
 
 	n = IncrementNonce(n)
-	b, err = ant.AESGCMEncrypt(d, k, n)
+	b, err = x.AESGCMEncrypt(d, k, n)
 	if err != nil {
 		return nil, err
 	}
@@ -88,24 +102,24 @@ func WriteTo(c *net.TCPConn, d, k, n []byte, needTime bool) ([]byte, error) {
 	return n, nil
 }
 
-// PrepareKey
+// PrepareKey.
 func PrepareKey(p []byte) ([]byte, []byte, error) {
-	return ant.HkdfSha256RandomSalt(p, []byte{0x62, 0x72, 0x6f, 0x6f, 0x6b}, 12)
+	return x.HkdfSha256RandomSalt(p, []byte{0x62, 0x72, 0x6f, 0x6f, 0x6b}, 12)
 }
 
-// GetKey
+// GetKey.
 func GetKey(p, n []byte) ([]byte, error) {
-	return ant.HkdfSha256WithSalt(p, n, []byte{0x62, 0x72, 0x6f, 0x6f, 0x6b})
+	return x.HkdfSha256WithSalt(p, n, []byte{0x62, 0x72, 0x6f, 0x6f, 0x6b})
 }
 
-// Encrypt data
+// Encrypt data.
 func Encrypt(p, b []byte) ([]byte, error) {
 	b = append(bytes.NewBufferString(strconv.Itoa(int(time.Now().Unix()))).Bytes(), b...)
 	k, n, err := PrepareKey(p)
 	if err != nil {
 		return nil, err
 	}
-	b, err = ant.AESGCMEncrypt(b, k, n)
+	b, err = x.AESGCMEncrypt(b, k, n)
 	if err != nil {
 		return nil, err
 	}
@@ -113,14 +127,14 @@ func Encrypt(p, b []byte) ([]byte, error) {
 	return b, nil
 }
 
-// Decrypt data
+// Decrypt data.
 func Decrypt(p, b []byte) (a byte, addr, port, data []byte, err error) {
 	err = errors.New("Data length error")
 	if len(b) <= 12+16 {
 		return
 	}
 	k, err := GetKey(p, b[0:12])
-	bb, err := ant.AESGCMDecrypt(b[12:], k, b[0:12])
+	bb, err := x.AESGCMDecrypt(b[12:], k, b[0:12])
 	if err != nil {
 		return
 	}
@@ -129,7 +143,7 @@ func Decrypt(p, b []byte) (a byte, addr, port, data []byte, err error) {
 		return
 	}
 	if time.Now().Unix()-int64(i) > 90 {
-		time.Sleep(time.Duration(ant.Random(1, 60*10)) * time.Second)
+		time.Sleep(time.Duration(x.Random(1, 60*10)) * time.Second)
 		err = errors.New("Expired request")
 		return
 	}

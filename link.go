@@ -15,16 +15,22 @@
 package brook
 
 import (
-	"github.com/txthinking/socks5"
+	"os"
+
+	"github.com/mdp/qrterminal"
 	"github.com/txthinking/x"
 )
 
-var Dial x.Dialer = x.DefaultDial
+// Link
+func Link(server, password string) string {
+	s := server + " " + password
+	s = "brook://" + x.URIEscape(s)
+	return s
+}
 
-var Debug bool = false
-
-// EnableDebug.
-func EnableDebug() {
-	socks5.Debug = true
-	Debug = true
+// QR generate and print QR code.
+func QR(server, password string) {
+	s := server + " " + password
+	s = "brook://" + x.URIEscape(s)
+	qrterminal.GenerateHalfBlock(s, qrterminal.L, os.Stdout)
 }

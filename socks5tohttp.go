@@ -1,14 +1,28 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
 	"bytes"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"time"
 
-	"github.com/txthinking/ant"
+	"github.com/txthinking/brook/plugin"
+	"github.com/txthinking/x"
 	"golang.org/x/net/proxy"
 )
 
@@ -17,13 +31,16 @@ type Socks5ToHTTP struct {
 	Socks5Address string
 	Dial          proxy.Dialer
 	Timeout       int
-	Deadline      int // Not refreshed
+	Deadline      int
 	Listen        *net.TCPListener
-	Middleman     HTTPMiddleman
+	HTTPMiddleman plugin.HTTPMiddleman
 }
 
 func NewSocks5ToHTTP(addr, socks5addr string, timeout, deadline int) (*Socks5ToHTTP, error) {
-	dial, err := proxy.SOCKS5("tcp", socks5addr, nil, proxy.Direct)
+	dial, err := proxy.SOCKS5("tcp", socks5addr, nil, &net.Dialer{
+		Timeout:   time.Duration(deadline) * time.Second,
+		KeepAlive: time.Duration(timeout) * time.Second,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -40,14 +57,18 @@ func NewSocks5ToHTTP(addr, socks5addr string, timeout, deadline int) (*Socks5ToH
 	}, nil
 }
 
-func (s *Socks5ToHTTP) ListenAndServe(h HTTPMiddleman) error {
+// SetHTTPMiddleman sets httpmiddleman plugin.
+func (s *Socks5ToHTTP) SetHTTPMiddleman(m plugin.HTTPMiddleman) {
+	s.HTTPMiddleman = m
+}
+
+func (s *Socks5ToHTTP) ListenAndServe() error {
 	l, err := net.ListenTCP("tcp", s.Addr)
 	if err != nil {
 		return err
 	}
 	defer l.Close()
 	s.Listen = l
-	s.Middleman = h
 	for {
 		c, err := l.AcceptTCP()
 		if err != nil {
@@ -103,19 +124,22 @@ func (s *Socks5ToHTTP) Handle(c *net.TCPConn) error {
 	}
 	if method != "CONNECT" {
 		var err error
-		addr, err = ant.GetAddressFromURL(address)
+		addr, err = x.GetAddressFromURL(address)
 		if err != nil {
 			return err
 		}
 	}
 
-	if s.Middleman != nil {
-		if done, err := s.Middleman.Handle(method, addr, b, c); err != nil || done {
+	if s.HTTPMiddleman != nil {
+		if done, err := s.HTTPMiddleman.Handle(method, addr, b, c); err != nil || done {
 			return err
 		}
 	}
 
-	tmp, err := Dial.Dial("tcp", addr)
+	if Debug {
+		log.Println("Dial TCP", addr)
+	}
+	tmp, err := s.Dial.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -143,9 +167,37 @@ func (s *Socks5ToHTTP) Handle(c *net.TCPConn) error {
 		}
 	}
 	go func() {
-		_, _ = io.Copy(rc, c)
+		var bf [1024 * 2]byte
+		for {
+			if s.Deadline != 0 {
+				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.Deadline) * time.Second)); err != nil {
+					return
+				}
+			}
+			i, err := rc.Read(bf[:])
+			if err != nil {
+				return
+			}
+			if _, err := c.Write(bf[0:i]); err != nil {
+				return
+			}
+		}
 	}()
-	_, _ = io.Copy(c, rc)
+	var bf [1024 * 2]byte
+	for {
+		if s.Deadline != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(s.Deadline) * time.Second)); err != nil {
+				return nil
+			}
+		}
+		i, err := c.Read(bf[:])
+		if err != nil {
+			return nil
+		}
+		if _, err := rc.Write(bf[0:i]); err != nil {
+			return nil
+		}
+	}
 	return nil
 }
 

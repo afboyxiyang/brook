@@ -1,3 +1,17 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
@@ -11,26 +25,27 @@ import (
 	"time"
 
 	cache "github.com/patrickmn/go-cache"
-	"github.com/txthinking/ant"
+	"github.com/txthinking/brook/plugin"
 	"github.com/txthinking/socks5"
+	xx "github.com/txthinking/x"
 )
 
-// SSClient
+// SSClient.
 type SSClient struct {
 	Server          *socks5.Server
 	RemoteAddr      string
 	Password        []byte
 	TCPTimeout      int
-	TCPDeadline     int // Not refreshed
+	TCPDeadline     int
 	UDPDeadline     int
-	Socks5Middleman Socks5Middleman
-	HTTPMiddleman   HTTPMiddleman
 	TCPListen       *net.TCPListener
+	Socks5Middleman plugin.Socks5Middleman
+	HTTPMiddleman   plugin.HTTPMiddleman
 }
 
-// NewSSClient returns a new SSClient
-func NewSSClient(addr, udpAddr, server, password string, tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime int) (*SSClient, error) {
-	s5, err := socks5.NewClassicServer(addr, udpAddr, "", "", tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime)
+// NewSSClient returns a new SSClient.
+func NewSSClient(addr, ip, server, password string, tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime int) (*SSClient, error) {
+	s5, err := socks5.NewClassicServer(addr, ip, "", "", tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime)
 	if err != nil {
 		return nil, err
 	}
@@ -45,14 +60,22 @@ func NewSSClient(addr, udpAddr, server, password string, tcpTimeout, tcpDeadline
 	return x, nil
 }
 
-// ListenAndServe will let client start a socks5 proxy
-// sm can be nil
-func (x *SSClient) ListenAndServe(sm Socks5Middleman) error {
-	x.Socks5Middleman = sm
+// SetSocks5Middleman sets socks5middleman plugin.
+func (x *SSClient) SetSocks5Middleman(m plugin.Socks5Middleman) {
+	x.Socks5Middleman = m
+}
+
+// SetHTTPMiddleman sets httpmiddleman plugin.
+func (x *SSClient) SetHTTPMiddleman(m plugin.HTTPMiddleman) {
+	x.HTTPMiddleman = m
+}
+
+// ListenAndServe will let client start a socks5 proxy.
+func (x *SSClient) ListenAndServe() error {
 	return x.Server.Run(x)
 }
 
-// TCPHandle handles tcp reqeust
+// TCPHandle handles tcp request.
 func (x *SSClient) TCPHandle(s *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
 	if x.Socks5Middleman != nil {
 		done, err := x.Socks5Middleman.TCPHandle(s, c, r)
@@ -111,13 +134,41 @@ func (x *SSClient) TCPHandle(s *socks5.Server, c *net.TCPConn, r *socks5.Request
 				log.Println(err)
 				return
 			}
-			_, _ = io.Copy(c, crc)
+			var bf [1024 * 2]byte
+			for {
+				if x.TCPDeadline != 0 {
+					if err := crc.SetDeadline(time.Now().Add(time.Duration(x.TCPDeadline) * time.Second)); err != nil {
+						return
+					}
+				}
+				i, err := crc.Read(bf[:])
+				if err != nil {
+					return
+				}
+				if _, err := c.Write(bf[0:i]); err != nil {
+					return
+				}
+			}
 		}()
-		_, _ = io.Copy(crc, c)
+		var bf [1024 * 2]byte
+		for {
+			if x.TCPDeadline != 0 {
+				if err := c.SetDeadline(time.Now().Add(time.Duration(x.TCPDeadline) * time.Second)); err != nil {
+					return nil
+				}
+			}
+			i, err := c.Read(bf[:])
+			if err != nil {
+				return nil
+			}
+			if _, err := crc.Write(bf[0:i]); err != nil {
+				return nil
+			}
+		}
 		return nil
 	}
 	if r.Cmd == socks5.CmdUDP {
-		caddr, err := r.UDP(c, x.Server.UDPAddr)
+		caddr, err := r.UDP(c, x.Server.ServerAddr)
 		if err != nil {
 			return err
 		}
@@ -137,7 +188,7 @@ func (x *SSClient) TCPHandle(s *socks5.Server, c *net.TCPConn, r *socks5.Request
 	return socks5.ErrUnsupportCmd
 }
 
-// UDPHandle handles udp reqeust
+// UDPHandle handles udp request.
 func (x *SSClient) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datagram) error {
 	if x.Socks5Middleman != nil {
 		if done, err := x.Socks5Middleman.UDPHandle(s, addr, d); err != nil || done {
@@ -166,6 +217,11 @@ func (x *SSClient) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Data
 
 	c, err := Dial.Dial("udp", x.RemoteAddr)
 	if err != nil {
+		v, ok := s.TCPUDPAssociate.Get(addr.String())
+		if ok {
+			ch := v.(chan byte)
+			ch <- 0x00
+		}
 		return err
 	}
 	rc := c.(*net.UDPConn)
@@ -174,6 +230,12 @@ func (x *SSClient) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Data
 		RemoteConn: rc,
 	}
 	if err := send(ue, d.Bytes()[3:]); err != nil {
+		v, ok := s.TCPUDPAssociate.Get(ue.ClientAddr.String())
+		if ok {
+			ch := v.(chan byte)
+			ch <- 0x00
+		}
+		ue.RemoteConn.Close()
 		return err
 	}
 	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
@@ -182,7 +244,7 @@ func (x *SSClient) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Data
 			v, ok := s.TCPUDPAssociate.Get(ue.ClientAddr.String())
 			if ok {
 				ch := v.(chan byte)
-				ch <- '0'
+				ch <- 0x00
 			}
 			s.UDPExchanges.Delete(ue.ClientAddr.String())
 			ue.RemoteConn.Close()
@@ -220,11 +282,9 @@ func (x *SSClient) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Data
 	return nil
 }
 
-// ListenAndServeHTTP will let client start a http proxy
-// m can be nil
-func (x *SSClient) ListenAndServeHTTP(m HTTPMiddleman) error {
+// ListenAndServeHTTP will let client start a http proxy.
+func (x *SSClient) ListenAndServeHTTP() error {
 	var err error
-	x.HTTPMiddleman = m
 	x.TCPListen, err = net.ListenTCP("tcp", x.Server.TCPAddr)
 	if err != nil {
 		return nil
@@ -256,7 +316,7 @@ func (x *SSClient) ListenAndServeHTTP(m HTTPMiddleman) error {
 	}
 }
 
-// HTTPHandle handle http request
+// HTTPHandle handles http request.
 func (x *SSClient) HTTPHandle(c *net.TCPConn) error {
 	b := make([]byte, 0, 1024)
 	for {
@@ -284,7 +344,7 @@ func (x *SSClient) HTTPHandle(c *net.TCPConn) error {
 	}
 	if method != "CONNECT" {
 		var err error
-		addr, err = ant.GetAddressFromURL(aoru)
+		addr, err = xx.GetAddressFromURL(aoru)
 		if err != nil {
 			return err
 		}
@@ -346,13 +406,41 @@ func (x *SSClient) HTTPHandle(c *net.TCPConn) error {
 			log.Println(err)
 			return
 		}
-		_, _ = io.Copy(c, crc)
+		var bf [1024 * 2]byte
+		for {
+			if x.TCPDeadline != 0 {
+				if err := crc.SetDeadline(time.Now().Add(time.Duration(x.TCPDeadline) * time.Second)); err != nil {
+					return
+				}
+			}
+			i, err := crc.Read(bf[:])
+			if err != nil {
+				return
+			}
+			if _, err := c.Write(bf[0:i]); err != nil {
+				return
+			}
+		}
 	}()
-	_, _ = io.Copy(crc, c)
+	var bf [1024 * 2]byte
+	for {
+		if x.TCPDeadline != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(x.TCPDeadline) * time.Second)); err != nil {
+				return nil
+			}
+		}
+		i, err := c.Read(bf[:])
+		if err != nil {
+			return nil
+		}
+		if _, err := crc.Write(bf[0:i]); err != nil {
+			return nil
+		}
+	}
 	return nil
 }
 
-// WrapChiperConn make a chiper conn
+// WrapChiperConn makes a chiper conn.
 func (x *SSClient) WrapCipherConn(conn *net.TCPConn) (*CipherConn, error) {
 	iv := make([]byte, aes.BlockSize)
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
@@ -364,15 +452,15 @@ func (x *SSClient) WrapCipherConn(conn *net.TCPConn) (*CipherConn, error) {
 	return NewCipherConn(conn, x.Password, iv)
 }
 
-// Encrypt data
+// Encrypt data.
 func (x *SSClient) Encrypt(rawdata []byte) ([]byte, error) {
-	return ant.AESCFBEncrypt(rawdata, x.Password)
+	return xx.AESCFBEncrypt(rawdata, x.Password)
 }
 
-// Decrypt data
+// Decrypt data.
 func (x *SSClient) Decrypt(cd []byte) (a byte, addr, port, data []byte, err error) {
 	var bb []byte
-	bb, err = ant.AESCFBDecrypt(cd, x.Password)
+	bb, err = xx.AESCFBDecrypt(cd, x.Password)
 	if err != nil {
 		return
 	}
@@ -423,7 +511,7 @@ func (x *SSClient) Decrypt(cd []byte) (a byte, addr, port, data []byte, err erro
 	return
 }
 
-// Shutdown used to stop the client
+// Shutdown used to stop the client.
 func (x *SSClient) Shutdown() error {
 	return x.Server.Stop()
 }

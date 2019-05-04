@@ -1,3 +1,17 @@
+// Copyright (c) 2016-present Cloud <cloud@txthinking.com>
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 3 of the GNU General Public
+// License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package brook
 
 import (
@@ -9,11 +23,12 @@ import (
 	"time"
 
 	cache "github.com/patrickmn/go-cache"
-	"github.com/txthinking/ant"
+	"github.com/txthinking/brook/plugin"
 	"github.com/txthinking/socks5"
+	xx "github.com/txthinking/x"
 )
 
-// Client
+// Client.
 type Client struct {
 	Server          *socks5.Server
 	RemoteAddr      string
@@ -21,14 +36,14 @@ type Client struct {
 	TCPTimeout      int
 	TCPDeadline     int
 	UDPDeadline     int
-	Socks5Middleman Socks5Middleman
-	HTTPMiddleman   HTTPMiddleman
 	TCPListen       *net.TCPListener
+	Socks5Middleman plugin.Socks5Middleman
+	HTTPMiddleman   plugin.HTTPMiddleman
 }
 
-// NewClient returns a new Client
-func NewClient(addr, udpAddr, server, password string, tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime int) (*Client, error) {
-	s5, err := socks5.NewClassicServer(addr, udpAddr, "", "", tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime)
+// NewClient returns a new Client.
+func NewClient(addr, ip, server, password string, tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime int) (*Client, error) {
+	s5, err := socks5.NewClassicServer(addr, ip, "", "", tcpTimeout, tcpDeadline, udpDeadline, udpSessionTime)
 	if err != nil {
 		return nil, err
 	}
@@ -43,14 +58,22 @@ func NewClient(addr, udpAddr, server, password string, tcpTimeout, tcpDeadline, 
 	return x, nil
 }
 
-// ListenAndServe will let client start a socks5 proxy
-// sm can be nil
-func (x *Client) ListenAndServe(sm Socks5Middleman) error {
-	x.Socks5Middleman = sm
+// SetSocks5Middleman sets socks5middleman plugin.
+func (x *Client) SetSocks5Middleman(m plugin.Socks5Middleman) {
+	x.Socks5Middleman = m
+}
+
+// SetHTTPMiddleman sets httpmiddleman plugin.
+func (x *Client) SetHTTPMiddleman(m plugin.HTTPMiddleman) {
+	x.HTTPMiddleman = m
+}
+
+// ListenAndServe will let client start a socks5 proxy.
+func (x *Client) ListenAndServe() error {
 	return x.Server.Run(x)
 }
 
-// TCPHandle handles tcp reqeust
+// TCPHandle handles tcp request.
 func (x *Client) TCPHandle(s *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
 	if x.Socks5Middleman != nil {
 		done, err := x.Socks5Middleman.TCPHandle(s, c, r)
@@ -155,7 +178,7 @@ func (x *Client) TCPHandle(s *socks5.Server, c *net.TCPConn, r *socks5.Request) 
 		return nil
 	}
 	if r.Cmd == socks5.CmdUDP {
-		caddr, err := r.UDP(c, x.Server.UDPAddr)
+		caddr, err := r.UDP(c, x.Server.ServerAddr)
 		if err != nil {
 			return err
 		}
@@ -175,7 +198,7 @@ func (x *Client) TCPHandle(s *socks5.Server, c *net.TCPConn, r *socks5.Request) 
 	return socks5.ErrUnsupportCmd
 }
 
-// UDPHandle handles udp reqeust
+// UDPHandle handles udp request.
 func (x *Client) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datagram) error {
 	if x.Socks5Middleman != nil {
 		if done, err := x.Socks5Middleman.UDPHandle(s, addr, d); err != nil || done {
@@ -204,6 +227,12 @@ func (x *Client) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datagr
 
 	c, err := Dial.Dial("udp", x.RemoteAddr)
 	if err != nil {
+		v, ok := s.TCPUDPAssociate.Get(addr.String())
+		if ok {
+			ch := v.(chan byte)
+			ch <- 0x00
+			s.TCPUDPAssociate.Delete(addr.String())
+		}
 		return err
 	}
 	rc := c.(*net.UDPConn)
@@ -212,6 +241,13 @@ func (x *Client) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datagr
 		RemoteConn: rc,
 	}
 	if err := send(ue, d.Bytes()[3:]); err != nil {
+		v, ok := s.TCPUDPAssociate.Get(ue.ClientAddr.String())
+		if ok {
+			ch := v.(chan byte)
+			ch <- 0x00
+			s.TCPUDPAssociate.Delete(ue.ClientAddr.String())
+		}
+		ue.RemoteConn.Close()
 		return err
 	}
 	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
@@ -220,7 +256,7 @@ func (x *Client) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datagr
 			v, ok := s.TCPUDPAssociate.Get(ue.ClientAddr.String())
 			if ok {
 				ch := v.(chan byte)
-				ch <- '0'
+				ch <- 0x00
 			}
 			s.UDPExchanges.Delete(ue.ClientAddr.String())
 			ue.RemoteConn.Close()
@@ -255,11 +291,9 @@ func (x *Client) UDPHandle(s *socks5.Server, addr *net.UDPAddr, d *socks5.Datagr
 	return nil
 }
 
-// ListenAndServeHTTP will let client start a http proxy
-// m can be nil
-func (x *Client) ListenAndServeHTTP(m HTTPMiddleman) error {
+// ListenAndServeHTTP will let client start a http proxy.
+func (x *Client) ListenAndServeHTTP() error {
 	var err error
-	x.HTTPMiddleman = m
 	x.TCPListen, err = net.ListenTCP("tcp", x.Server.TCPAddr)
 	if err != nil {
 		return nil
@@ -291,9 +325,8 @@ func (x *Client) ListenAndServeHTTP(m HTTPMiddleman) error {
 	}
 }
 
-// HTTPHandle handle http request
+// HTTPHandle handles http request.
 func (x *Client) HTTPHandle(c *net.TCPConn) error {
-	log.Println("Got http connection")
 	b := make([]byte, 0, 1024)
 	for {
 		var b1 [1024]byte
@@ -320,7 +353,7 @@ func (x *Client) HTTPHandle(c *net.TCPConn) error {
 	}
 	if method != "CONNECT" {
 		var err error
-		addr, err = ant.GetAddressFromURL(aoru)
+		addr, err = xx.GetAddressFromURL(aoru)
 		if err != nil {
 			return err
 		}
@@ -429,7 +462,7 @@ func (x *Client) HTTPHandle(c *net.TCPConn) error {
 	return nil
 }
 
-// Shutdown used to stop the client
+// Shutdown used to stop the client.
 func (x *Client) Shutdown() error {
 	return x.Server.Stop()
 }
