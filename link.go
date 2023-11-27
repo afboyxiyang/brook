@@ -15,22 +15,23 @@
 package brook
 
 import (
-	"os"
-
-	"github.com/mdp/qrterminal"
-	"github.com/txthinking/x"
+	"fmt"
+	"net/url"
 )
 
-// Link
-func Link(server, password string) string {
-	s := server + " " + password
-	s = "brook://" + x.URIEscape(s)
-	return s
+func Link(kind, server string, v url.Values) string {
+	v.Set(kind, server)
+	return fmt.Sprintf("brook://%s?%s", kind, v.Encode())
 }
 
-// QR generate and print QR code.
-func QR(server, password string) {
-	s := server + " " + password
-	s = "brook://" + x.URIEscape(s)
-	qrterminal.GenerateHalfBlock(s, qrterminal.L, os.Stdout)
+func ParseLink(link string) (kind, server string, v url.Values, err error) {
+	var u *url.URL
+	u, err = url.Parse(link)
+	if err != nil {
+		return
+	}
+	kind = u.Host
+	server = u.Query().Get(kind)
+	v = u.Query()
+	return
 }

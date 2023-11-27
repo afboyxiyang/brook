@@ -15,170 +15,121 @@
 package brook
 
 import (
-	"log"
+	"errors"
 	"net"
 	"time"
 
-	cache "github.com/patrickmn/go-cache"
+	"github.com/miekg/dns"
+	"github.com/txthinking/brook/limits"
+	"github.com/txthinking/runnergroup"
 	"github.com/txthinking/socks5"
 )
 
-// Relay is relay server.
 type Relay struct {
-	TCPAddr       *net.TCPAddr
-	UDPAddr       *net.UDPAddr
-	RemoteTCPAddr *net.TCPAddr
-	RemoteUDPAddr *net.UDPAddr
-	TCPListen     *net.TCPListener
-	UDPConn       *net.UDPConn
-	UDPExchanges  *cache.Cache
-	TCPDeadline   int
-	TCPTimeout    int
-	UDPDeadline   int
+	From        string
+	To          string
+	Dstb        []byte
+	TCPTimeout  int
+	UDPTimeout  int
+	Pcf         *PacketConnFactory
+	RunnerGroup *runnergroup.RunnerGroup
+	IsDNS       bool
 }
 
-// NewRelay returns a Relay.
-func NewRelay(addr, remote string, tcpTimeout, tcpDeadline, udpDeadline int) (*Relay, error) {
-	taddr, err := net.ResolveTCPAddr("tcp", addr)
+func NewRelay(from, to string, tcpTimeout, udpTimeout int) (*Relay, error) {
+	if err := limits.Raise(); err != nil {
+		Log(Error{"when": "try to raise system limits", "warning": err.Error()})
+	}
+	a, h, p, err := socks5.ParseAddress(to)
 	if err != nil {
 		return nil, err
 	}
-	uaddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	rtaddr, err := net.ResolveTCPAddr("tcp", remote)
-	if err != nil {
-		return nil, err
-	}
-	ruaddr, err := net.ResolveUDPAddr("udp", remote)
-	if err != nil {
-		return nil, err
-	}
-	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
 	s := &Relay{
-		TCPAddr:       taddr,
-		UDPAddr:       uaddr,
-		RemoteTCPAddr: rtaddr,
-		RemoteUDPAddr: ruaddr,
-		UDPExchanges:  cs,
-		TCPTimeout:    tcpTimeout,
-		TCPDeadline:   tcpDeadline,
-		UDPDeadline:   udpDeadline,
+		From:        from,
+		To:          to,
+		Dstb:        append(append([]byte{a}, h...), p...),
+		TCPTimeout:  tcpTimeout,
+		UDPTimeout:  udpTimeout,
+		Pcf:         NewPacketConnFactory(),
+		RunnerGroup: runnergroup.New(),
 	}
 	return s, nil
 }
 
-// Run server.
 func (s *Relay) ListenAndServe() error {
-	errch := make(chan error)
-	go func() {
-		errch <- s.RunTCPServer()
-	}()
-	go func() {
-		errch <- s.RunUDPServer()
-	}()
-	return <-errch
-}
-
-// RunTCPServer starts tcp server.
-func (s *Relay) RunTCPServer() error {
-	var err error
-	s.TCPListen, err = net.ListenTCP("tcp", s.TCPAddr)
+	addr, err := net.ResolveTCPAddr("tcp", s.From)
 	if err != nil {
 		return err
 	}
-	defer s.TCPListen.Close()
-	for {
-		c, err := s.TCPListen.AcceptTCP()
-		if err != nil {
-			return err
-		}
-		go func(c *net.TCPConn) {
-			defer c.Close()
-			if s.TCPTimeout != 0 {
-				if err := c.SetKeepAlivePeriod(time.Duration(s.TCPTimeout) * time.Second); err != nil {
-					log.Println(err)
-					return
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return err
+	}
+	s.RunnerGroup.Add(&runnergroup.Runner{
+		Start: func() error {
+			for {
+				c, err := l.AcceptTCP()
+				if err != nil {
+					return err
 				}
+				go func(c *net.TCPConn) {
+					defer c.Close()
+					if err := s.TCPHandle(c); err != nil {
+						Log(Error{"from": c.RemoteAddr().String(), "error": err.Error()})
+					}
+				}(c)
 			}
-			if s.TCPDeadline != 0 {
-				if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
-					log.Println(err)
-					return
+			return nil
+		},
+		Stop: func() error {
+			return l.Close()
+		},
+	})
+	addr1, err := net.ResolveUDPAddr("udp", s.From)
+	if err != nil {
+		l.Close()
+		return err
+	}
+	l1, err := net.ListenUDP("udp", addr1)
+	if err != nil {
+		l.Close()
+		return err
+	}
+	s.RunnerGroup.Add(&runnergroup.Runner{
+		Start: func() error {
+			for {
+				b := make([]byte, 65507)
+				n, addr, err := l1.ReadFromUDP(b)
+				if err != nil {
+					return err
 				}
+				go func(addr *net.UDPAddr, b []byte) {
+					if err := s.UDPHandle(addr, b, l1); err != nil {
+						Log(Error{"from": addr.String(), "error": err.Error()})
+						return
+					}
+				}(addr, b[0:n])
 			}
-			if err := s.TCPHandle(c); err != nil {
-				log.Println(err)
-			}
-		}(c)
-	}
-	return nil
+			return nil
+		},
+		Stop: func() error {
+			return l1.Close()
+		},
+	})
+	return s.RunnerGroup.Wait()
 }
 
-// RunUDPServer starts udp server.
-func (s *Relay) RunUDPServer() error {
-	var err error
-	s.UDPConn, err = net.ListenUDP("udp", s.UDPAddr)
-	if err != nil {
-		return err
-	}
-	defer s.UDPConn.Close()
-	for {
-		b := make([]byte, 65536)
-		n, addr, err := s.UDPConn.ReadFromUDP(b)
-		if err != nil {
-			return err
-		}
-		go func(addr *net.UDPAddr, b []byte) {
-			if err := s.UDPHandle(addr, b); err != nil {
-				log.Println(err)
-				return
-			}
-		}(addr, b[0:n])
-	}
-	return nil
-}
-
-// Shutdown server.
-func (s *Relay) Shutdown() error {
-	var err, err1 error
-	if s.TCPListen != nil {
-		err = s.TCPListen.Close()
-	}
-	if s.UDPConn != nil {
-		err1 = s.UDPConn.Close()
-	}
-	if err != nil {
-		return err
-	}
-	return err1
-}
-
-// TCPHandle handles request.
 func (s *Relay) TCPHandle(c *net.TCPConn) error {
-	tmp, err := Dial.Dial("tcp", s.RemoteTCPAddr.String())
+	rc, err := DialTCP("tcp", "", s.To)
 	if err != nil {
 		return err
 	}
-	rc := tmp.(*net.TCPConn)
 	defer rc.Close()
-	if s.TCPTimeout != 0 {
-		if err := rc.SetKeepAlivePeriod(time.Duration(s.TCPTimeout) * time.Second); err != nil {
-			return err
-		}
-	}
-	if s.TCPDeadline != 0 {
-		if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
-			return err
-		}
-	}
-
 	go func() {
 		var bf [1024 * 2]byte
 		for {
-			if s.TCPDeadline != 0 {
-				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
+			if s.TCPTimeout != 0 {
+				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
 					return
 				}
 			}
@@ -193,8 +144,8 @@ func (s *Relay) TCPHandle(c *net.TCPConn) error {
 	}()
 	var bf [1024 * 2]byte
 	for {
-		if s.TCPDeadline != 0 {
-			if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPDeadline) * time.Second)); err != nil {
+		if s.TCPTimeout != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
 				return nil
 			}
 		}
@@ -209,60 +160,73 @@ func (s *Relay) TCPHandle(c *net.TCPConn) error {
 	return nil
 }
 
-// UDPHandle handles packet.
-func (s *Relay) UDPHandle(addr *net.UDPAddr, b []byte) error {
-	send := func(ue *socks5.UDPExchange, data []byte) error {
-		_, err := ue.RemoteConn.Write(data)
+func (s *Relay) UDPHandle(addr *net.UDPAddr, b []byte, l1 *net.UDPConn) error {
+	if s.IsDNS {
+		m := &dns.Msg{}
+		if err := m.Unpack(b); err != nil {
+			return err
+		}
+		if len(m.Question) == 0 {
+			return errors.New("no question")
+		}
+		done, err := DNSGate(addr, m, l1)
 		if err != nil {
 			return err
 		}
-		return nil
+		if done {
+			return nil
+		}
 	}
-
-	var ue *socks5.UDPExchange
-	iue, ok := s.UDPExchanges.Get(addr.String())
-	if ok {
-		ue = iue.(*socks5.UDPExchange)
-		return send(ue, b)
-	}
-
-	tmp, err := Dial.Dial("udp", s.RemoteUDPAddr.String())
+	c, err := s.Pcf.Handle(addr, s.Dstb, b, func(b []byte) (int, error) {
+		return l1.WriteToUDP(b, addr)
+	}, s.UDPTimeout)
 	if err != nil {
 		return err
 	}
-	rc := tmp.(*net.UDPConn)
-	ue = &socks5.UDPExchange{
-		ClientAddr: addr,
-		RemoteConn: rc,
+	if c == nil {
+		return nil
 	}
-	if err := send(ue, b); err != nil {
-		ue.RemoteConn.Close()
+	defer c.Close()
+	rc, err := NATDial("udp", addr.String(), s.To, s.To)
+	if err != nil {
 		return err
 	}
-	s.UDPExchanges.Set(ue.ClientAddr.String(), ue, cache.DefaultExpiration)
-	go func(ue *socks5.UDPExchange) {
-		defer func() {
-			s.UDPExchanges.Delete(ue.ClientAddr.String())
-			ue.RemoteConn.Close()
-		}()
-		var b [65536]byte
+	defer rc.Close()
+	go func() {
+		var bf [65507]byte
 		for {
-			if s.UDPDeadline != 0 {
-				if err := ue.RemoteConn.SetDeadline(time.Now().Add(time.Duration(s.UDPDeadline) * time.Second)); err != nil {
-					log.Println(err)
-					break
+			if s.UDPTimeout != 0 {
+				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.UDPTimeout) * time.Second)); err != nil {
+					return
 				}
 			}
-			n, err := ue.RemoteConn.Read(b[:])
+			i, err := rc.Read(bf[:])
 			if err != nil {
-				log.Println(err)
-				break
+				return
 			}
-			if _, err := s.UDPConn.WriteToUDP(b[0:n], ue.ClientAddr); err != nil {
-				log.Println(err)
-				break
+			if _, err := c.Write(bf[0:i]); err != nil {
+				return
 			}
 		}
-	}(ue)
+	}()
+	var bf [65507]byte
+	for {
+		if s.UDPTimeout != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(s.UDPTimeout) * time.Second)); err != nil {
+				return nil
+			}
+		}
+		i, err := c.Read(bf[:])
+		if err != nil {
+			return nil
+		}
+		if _, err := rc.Write(bf[0:i]); err != nil {
+			return nil
+		}
+	}
 	return nil
+}
+
+func (s *Relay) Shutdown() error {
+	return s.RunnerGroup.Done()
 }

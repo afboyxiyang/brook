@@ -15,7 +15,12 @@
 package brook
 
 import (
+	"crypto/sha256"
+	"errors"
+	"hash"
 	"net"
+	"net/url"
+	"time"
 
 	"github.com/txthinking/socks5"
 )
@@ -27,8 +32,69 @@ func ErrorReply(r *socks5.Request, c *net.TCPConn, e error) error {
 	} else {
 		p = socks5.NewReply(socks5.RepConnectionRefused, socks5.ATYPIPv6, net.IPv6zero, []byte{0x00, 0x00})
 	}
-	if err := p.WriteTo(c); err != nil {
+	if _, err := p.WriteTo(c); err != nil {
 		return err
 	}
 	return e
+}
+
+func GetAddressFromURL(s string) (string, error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", err
+	}
+	if _, _, err := net.SplitHostPort(u.Host); err == nil {
+		return u.Host, nil
+	}
+	return net.JoinHostPort(u.Host, "80"), nil
+}
+
+func Conn2Conn(c, rc net.Conn, bufsize, timeout int) {
+	go func() {
+		bf := make([]byte, bufsize)
+		for {
+			if timeout != 0 {
+				if err := rc.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second)); err != nil {
+					return
+				}
+			}
+			i, err := rc.Read(bf)
+			if err != nil {
+				return
+			}
+			if _, err := c.Write(bf[0:i]); err != nil {
+				return
+			}
+		}
+	}()
+	bf := make([]byte, bufsize)
+	for {
+		if timeout != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second)); err != nil {
+				return
+			}
+		}
+		i, err := c.Read(bf)
+		if err != nil {
+			return
+		}
+		if _, err := rc.Write(bf[0:i]); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func SHA256Bytes(s []byte) ([]byte, error) {
+	var h hash.Hash
+	h = sha256.New()
+	n, err := h.Write(s)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(s) {
+		return nil, errors.New("Write length error")
+	}
+	r := h.Sum(nil)
+	return r, nil
 }

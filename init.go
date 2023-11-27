@@ -14,17 +14,8 @@
 
 package brook
 
-import (
-	"github.com/txthinking/socks5"
-	"github.com/txthinking/x"
-)
+var ServerHKDFInfo = []byte{0x62, 0x72, 0x6f, 0x6f, 0x6b}
+var ClientHKDFInfo = []byte{0x62, 0x72, 0x6f, 0x6f, 0x6b}
 
-var Dial x.Dialer = x.DefaultDial
-
-var Debug bool = false
-
-// EnableDebug.
-func EnableDebug() {
-	socks5.Debug = true
-	Debug = true
+func init() {
 }

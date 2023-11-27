@@ -17,53 +17,55 @@ package brook
 import (
 	"bytes"
 	"errors"
-	"log"
 	"net"
 	"time"
 
-	"github.com/txthinking/brook/plugin"
-	"github.com/txthinking/x"
+	"github.com/txthinking/brook/limits"
 	"golang.org/x/net/proxy"
 )
 
 type Socks5ToHTTP struct {
-	Addr          *net.TCPAddr
-	Socks5Address string
-	Dial          proxy.Dialer
-	Timeout       int
-	Deadline      int
-	Listen        *net.TCPListener
-	HTTPMiddleman plugin.HTTPMiddleman
+	Addr       string
+	Dial       proxy.Dialer
+	TCPTimeout int
+	Listen     *net.TCPListener
 }
 
-func NewSocks5ToHTTP(addr, socks5addr string, timeout, deadline int) (*Socks5ToHTTP, error) {
-	dial, err := proxy.SOCKS5("tcp", socks5addr, nil, &net.Dialer{
-		Timeout:   time.Duration(deadline) * time.Second,
-		KeepAlive: time.Duration(timeout) * time.Second,
-	})
-	if err != nil {
-		return nil, err
+type _pd struct {
+}
+
+func (p *_pd) Dial(network, addr string) (c net.Conn, err error) {
+	return DialTCP(network, "", addr)
+}
+
+func NewSocks5ToHTTP(addr, socks5addr, socks5username, socks5password string, tcpTimeout int) (*Socks5ToHTTP, error) {
+	if err := limits.Raise(); err != nil {
+		Log(Error{"when": "try to raise system limits", "warning": err.Error()})
 	}
-	ta, err := net.ResolveTCPAddr("tcp", addr)
+	var auth *proxy.Auth
+	if socks5username != "" || socks5password != "" {
+		auth = &proxy.Auth{
+			User:     socks5username,
+			Password: socks5password,
+		}
+	}
+	dial, err := proxy.SOCKS5("tcp", socks5addr, auth, &_pd{})
 	if err != nil {
 		return nil, err
 	}
 	return &Socks5ToHTTP{
-		Addr:          ta,
-		Socks5Address: socks5addr,
-		Dial:          dial,
-		Timeout:       timeout,
-		Deadline:      deadline,
+		Addr:       addr,
+		Dial:       dial,
+		TCPTimeout: tcpTimeout,
 	}, nil
 }
 
-// SetHTTPMiddleman sets httpmiddleman plugin.
-func (s *Socks5ToHTTP) SetHTTPMiddleman(m plugin.HTTPMiddleman) {
-	s.HTTPMiddleman = m
-}
-
 func (s *Socks5ToHTTP) ListenAndServe() error {
-	l, err := net.ListenTCP("tcp", s.Addr)
+	addr, err := net.ResolveTCPAddr("tcp", s.Addr)
+	if err != nil {
+		return err
+	}
+	l, err := net.ListenTCP("tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -76,20 +78,14 @@ func (s *Socks5ToHTTP) ListenAndServe() error {
 		}
 		go func(c *net.TCPConn) {
 			defer c.Close()
-			if s.Timeout != 0 {
-				if err := c.SetKeepAlivePeriod(time.Duration(s.Timeout) * time.Second); err != nil {
-					log.Println(err)
-					return
-				}
-			}
-			if s.Deadline != 0 {
-				if err := c.SetDeadline(time.Now().Add(time.Duration(s.Deadline) * time.Second)); err != nil {
-					log.Println(err)
+			if s.TCPTimeout != 0 {
+				if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
+					Log(err)
 					return
 				}
 			}
 			if err := s.Handle(c); err != nil {
-				log.Println(err)
+				Log(err)
 				return
 			}
 		}(c)
@@ -124,34 +120,20 @@ func (s *Socks5ToHTTP) Handle(c *net.TCPConn) error {
 	}
 	if method != "CONNECT" {
 		var err error
-		addr, err = x.GetAddressFromURL(address)
+		addr, err = GetAddressFromURL(address)
 		if err != nil {
 			return err
 		}
 	}
 
-	if s.HTTPMiddleman != nil {
-		if done, err := s.HTTPMiddleman.Handle(method, addr, b, c); err != nil || done {
-			return err
-		}
-	}
-
-	if Debug {
-		log.Println("Dial TCP", addr)
-	}
 	tmp, err := s.Dial.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
 	rc := tmp.(*net.TCPConn)
 	defer rc.Close()
-	if s.Timeout != 0 {
-		if err := rc.SetKeepAlivePeriod(time.Duration(s.Timeout) * time.Second); err != nil {
-			return err
-		}
-	}
-	if s.Deadline != 0 {
-		if err := rc.SetDeadline(time.Now().Add(time.Duration(s.Deadline) * time.Second)); err != nil {
+	if s.TCPTimeout != 0 {
+		if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
 			return err
 		}
 	}
@@ -169,8 +151,8 @@ func (s *Socks5ToHTTP) Handle(c *net.TCPConn) error {
 	go func() {
 		var bf [1024 * 2]byte
 		for {
-			if s.Deadline != 0 {
-				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.Deadline) * time.Second)); err != nil {
+			if s.TCPTimeout != 0 {
+				if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
 					return
 				}
 			}
@@ -185,8 +167,8 @@ func (s *Socks5ToHTTP) Handle(c *net.TCPConn) error {
 	}()
 	var bf [1024 * 2]byte
 	for {
-		if s.Deadline != 0 {
-			if err := c.SetDeadline(time.Now().Add(time.Duration(s.Deadline) * time.Second)); err != nil {
+		if s.TCPTimeout != 0 {
+			if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
 				return nil
 			}
 		}
