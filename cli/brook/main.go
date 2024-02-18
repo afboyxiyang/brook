@@ -15,11 +15,9 @@
 package main
 
 import (
-	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -28,14 +26,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	"net/http"
 	"net/url"
 
 	"github.com/miekg/dns"
+	"github.com/phuslu/iploc"
 	utls "github.com/refraction-networking/utls"
 	"github.com/txthinking/brook"
 	"github.com/txthinking/brook/plugins/block"
@@ -47,7 +44,6 @@ import (
 	"github.com/txthinking/brook/plugins/prometheus"
 	"github.com/txthinking/brook/plugins/socks5dial"
 	"github.com/txthinking/brook/plugins/thedns"
-	"github.com/txthinking/brook/plugins/tproxy"
 	"github.com/txthinking/runnergroup"
 	"github.com/txthinking/socks5"
 	"github.com/urfave/cli/v2"
@@ -58,7 +54,7 @@ func main() {
 	df := func() {}
 	app := cli.NewApp()
 	app.Name = "Brook"
-	app.Version = "20230606"
+	app.Version = "20240214"
 	app.Usage = "A cross-platform programmable network tool"
 	app.Authors = []*cli.Author{
 		{
@@ -133,12 +129,12 @@ func main() {
 		},
 		&cli.StringFlag{
 			Name:  "clientHKDFInfo",
-			Usage: "client HKDF info, most time you don't need to change this, read brook protocol if you don't know what this is",
+			Usage: "client HKDF info, most time you don't need to change this, if changed, all and each brook links in client side must be same, I mean each",
 			Value: "brook",
 		},
 		&cli.StringFlag{
 			Name:  "serverHKDFInfo",
-			Usage: "server HKDF info, most time you don't need to change this, read brook protocol if you don't know what this is",
+			Usage: "server HKDF info, most time you don't need to change this, if changed, all and each brook links in client side must be same, I mean each",
 			Value: "brook",
 		},
 	}
@@ -430,13 +426,7 @@ func main() {
 						},
 					})
 				}
-				go func() {
-					sigs := make(chan os.Signal, 1)
-					signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-					<-sigs
-					g.Done()
-				}()
-				return g.Wait()
+				return nil
 			},
 		},
 		&cli.Command{
@@ -1445,435 +1435,6 @@ func main() {
 						return s.Shutdown()
 					},
 				})
-				return nil
-			},
-		},
-		&cli.Command{
-			Name:  "tproxy",
-			Usage: "Run as transparent proxy, a router gateway, both TCP and UDP, only works on Linux, [src <-> $ brook tproxy <-> $ brook server/wsserver/wssserver/quicserver <-> dst]",
-			BashComplete: func(c *cli.Context) {
-				l := c.Command.VisibleFlags()
-				for _, v := range l {
-					fmt.Println("--" + v.Names()[0])
-				}
-			},
-			Flags: []cli.Flag{
-				&cli.StringFlag{
-					Name:    "listen",
-					Aliases: []string{"l"},
-					Usage:   "Listen address, DO NOT contain IP, just like: ':8888'. No need to operate iptables by default!",
-					Value:   ":8888",
-				},
-				&cli.StringFlag{
-					Name:  "dnsListen",
-					Usage: "Start a DNS server, like: ':53'. MUST contain IP, like '192.168.1.1:53', if you expect your gateway to accept requests from clients to other public DNS servers at the same time",
-				},
-				&cli.StringFlag{
-					Name:  "dnsForDefault",
-					Usage: "DNS server for resolving domains NOT in list",
-					Value: "8.8.8.8:53",
-				},
-				&cli.StringFlag{
-					Name:  "dnsForBypass",
-					Usage: "DNS server for resolving domains in bypass list. Such as 223.5.5.5:53 or https://dns.alidns.com/dns-query?address=223.5.5.5:443, the address is required",
-					Value: "223.5.5.5:53",
-				},
-				&cli.StringFlag{
-					Name:  "blockDomainList",
-					Usage: "One domain per line, Suffix match mode. https://, http:// or local file absolute path. Like: https://txthinking.github.io/bypass/example_domain.txt",
-				},
-				&cli.StringFlag{
-					Name:  "bypassDomainList",
-					Usage: "One domain per line, Suffix match mode. https://, http:// or local file absolute path. Like: https://txthinking.github.io/bypass/example_domain.txt",
-				},
-				&cli.BoolFlag{
-					Name:  "disableA",
-					Usage: "Disable A query",
-				},
-				&cli.BoolFlag{
-					Name:  "disableAAAA",
-					Usage: "Disable AAAA query",
-				},
-				&cli.StringFlag{
-					Name:  "bypassCIDR4List",
-					Usage: "One CIDR per line, https://, http:// or local file absolute path, like: https://txthinking.github.io/bypass/example_cidr4.txt",
-				},
-				&cli.StringFlag{
-					Name:  "bypassCIDR6List",
-					Usage: "One CIDR per line, https://, http:// or local file absolute path, like: https://txthinking.github.io/bypass/example_cidr6.txt",
-				},
-				&cli.StringSliceFlag{
-					Name:  "bypassGeoIP",
-					Usage: "Bypass IP by Geo country code, such as US",
-				},
-				&cli.StringFlag{
-					Name:  "redirectDNS",
-					Usage: "It is usually the value of dnsListen. If the client has set custom DNS instead of dnsListen, this parameter can be intercepted and forwarded to dnsListen. Usually you don't need to set this, only if you want to control it instead of being proxied directly as normal UDP data.",
-				},
-				&cli.BoolFlag{
-					Name:  "doNotRunScripts",
-					Usage: "This will not change iptables and others if you want to do by yourself",
-				},
-				&cli.StringFlag{
-					Name:  "webListen",
-					Usage: "Ignore all other parameters, run web UI, like: ':9999'",
-				},
-				&cli.StringFlag{
-					Name:    "server",
-					Aliases: []string{"s"},
-					Usage:   "brook server or brook wsserver or brook wssserver or brook quicserver, like: 1.2.3.4:9999, ws://1.2.3.4:9999, wss://domain.com:443/ws, quic://domain.com:443",
-				},
-				&cli.StringFlag{
-					Name:    "password",
-					Aliases: []string{"p"},
-					Usage:   "Password",
-				},
-				&cli.BoolFlag{
-					Name:  "udpovertcp",
-					Usage: "When server is brook server, UDP over TCP",
-				},
-				&cli.StringFlag{
-					Name:  "address",
-					Usage: "When server is brook wsserver or brook wssserver or brook quicserver, specify address instead of resolving addresses from host, such as 1.2.3.4:443",
-				},
-				&cli.BoolFlag{
-					Name:  "insecure",
-					Usage: "When server is brook wssserver or brook quicserver, client do not verify the server's certificate chain and host name",
-				},
-				&cli.BoolFlag{
-					Name:  "withoutBrookProtocol",
-					Usage: "When server is brook wsserver or brook wssserver or brook quicserver, the data will not be encrypted with brook protocol",
-				},
-				&cli.StringFlag{
-					Name:  "ca",
-					Usage: "When server is brook wssserver or brook quicserver, specify ca instead of insecure, such as /path/to/ca.pem",
-				},
-				&cli.StringFlag{
-					Name:  "tlsfingerprint",
-					Usage: "When server is brook wssserver, select tls fingerprint, value can be: chrome",
-				},
-				&cli.StringFlag{
-					Name:  "link",
-					Usage: "brook link. This will ignore server, password, udpovertcp, address, insecure, withoutBrookProtocol, ca, tlsfingerprint",
-				},
-				&cli.IntFlag{
-					Name:  "tcpTimeout",
-					Value: 0,
-					Usage: "time (s)",
-				},
-				&cli.IntFlag{
-					Name:  "udpTimeout",
-					Value: 60,
-					Usage: "time (s)",
-				},
-			},
-			Action: func(c *cli.Context) error {
-				if c.String("webListen") != "" {
-					go func() {
-						time.Sleep(3 * time.Second)
-						_ = os.WriteFile("/etc/resolv.conf", []byte("nameserver 8.8.8.8\nnameserver 2001:4860:4860::8888\n"), 0744)
-					}()
-					web, err := fs.Sub(static, "static")
-					if err != nil {
-						return err
-					}
-					var cmd *exec.Cmd
-					lock := &sync.Mutex{}
-					m := http.NewServeMux()
-					m.Handle("/", http.FileServer(http.FS(web)))
-					m.HandleFunc("/hasp", func(w http.ResponseWriter, r *http.Request) {
-						lock.Lock()
-						defer lock.Unlock()
-						_, err := os.Stat("/root/.brook.web.password")
-						if os.IsNotExist(err) {
-							w.Write([]byte("no"))
-							return
-						}
-						w.Write([]byte("yes"))
-					})
-					m.HandleFunc("/setp", func(w http.ResponseWriter, r *http.Request) {
-						lock.Lock()
-						defer lock.Unlock()
-						_, err := os.Stat("/root/.brook.web.password")
-						if !os.IsNotExist(err) {
-							http.Error(w, "file exsits", 500)
-							return
-						}
-						err = os.WriteFile("/root/.brook.web.password", []byte(r.FormValue("p")), 0600)
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						w.WriteHeader(200)
-					})
-					m.HandleFunc("/authp", func(w http.ResponseWriter, r *http.Request) {
-						lock.Lock()
-						defer lock.Unlock()
-						b, err := os.ReadFile("/root/.brook.web.password")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						if strings.TrimSpace(string(b)) != strings.TrimSpace(r.FormValue("p")) {
-							http.Error(w, "web ui password wrong", 500)
-							return
-						}
-						w.WriteHeader(200)
-					})
-					m.HandleFunc("/httpread", func(w http.ResponseWriter, r *http.Request) {
-						lock.Lock()
-						defer lock.Unlock()
-						b, err := os.ReadFile("/root/.brook.web.password")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						if strings.TrimSpace(string(b)) != strings.TrimSpace(r.FormValue("p")) {
-							http.Error(w, "web ui password wrong", 500)
-							return
-						}
-						b, err = brook.ReadData(r.FormValue("url"))
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						w.Write(b)
-					})
-					m.HandleFunc("/logread", func(w http.ResponseWriter, r *http.Request) {
-						lock.Lock()
-						defer lock.Unlock()
-						b, err := os.ReadFile("/root/.brook.web.password")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						if strings.TrimSpace(string(b)) != strings.TrimSpace(r.FormValue("p")) {
-							http.Error(w, "web ui password wrong", 500)
-							return
-						}
-						b, err = os.ReadFile("/root/.brook.log")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						w.Write(b)
-					})
-					m.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
-						b, err := os.ReadFile("/root/.brook.web.password")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						if strings.TrimSpace(string(b)) != strings.TrimSpace(r.FormValue("p")) {
-							http.Error(w, "web ui password wrong", 500)
-							return
-						}
-						s, err := os.Executable()
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						lock.Lock()
-						defer lock.Unlock()
-						cmd = exec.Command("/bin/sh", "-c", s+r.FormValue("args"))
-						done := make(chan byte)
-						defer close(done)
-						errch := make(chan error)
-						go func() {
-							out, _ := cmd.CombinedOutput()
-							select {
-							case <-done:
-								log.Println(string(out))
-							default:
-								select {
-								case <-done:
-									log.Println(string(out))
-								case errch <- errors.New(string(out)):
-								}
-							}
-							lock.Lock()
-							cmd = nil
-							lock.Unlock()
-						}()
-						select {
-						case err := <-errch:
-							http.Error(w, err.Error(), 500)
-							return
-						case <-time.After(6 * time.Second):
-							w.Write([]byte("connected"))
-						}
-					})
-					m.HandleFunc("/stop", func(w http.ResponseWriter, r *http.Request) {
-						b, err := os.ReadFile("/root/.brook.web.password")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						if strings.TrimSpace(string(b)) != strings.TrimSpace(r.FormValue("p")) {
-							http.Error(w, "web ui password wrong", 500)
-							return
-						}
-						lock.Lock()
-						defer lock.Unlock()
-						if cmd == nil {
-							w.Write([]byte("disconnected"))
-							return
-						}
-						if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						w.Write([]byte("disconnected"))
-					})
-					m.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-						b, err := os.ReadFile("/root/.brook.web.password")
-						if err != nil {
-							http.Error(w, err.Error(), 500)
-							return
-						}
-						if strings.TrimSpace(string(b)) != strings.TrimSpace(r.FormValue("p")) {
-							http.Error(w, "web ui password wrong", 500)
-							return
-						}
-						lock.Lock()
-						defer lock.Unlock()
-						if cmd == nil {
-							w.Write([]byte("disconnected"))
-							return
-						}
-						w.Write([]byte("connected"))
-					})
-					s := &http.Server{
-						Addr:    c.String("webListen"),
-						Handler: m,
-					}
-					g.Add(&runnergroup.Runner{
-						Start: func() error {
-							return s.ListenAndServe()
-						},
-						Stop: func() error {
-							if cmd != nil {
-								cmd.Process.Signal(syscall.SIGTERM)
-							}
-							return s.Shutdown(context.Background())
-						},
-					})
-					return nil
-				}
-				if c.String("listen") == "" || (c.String("link") == "" && (c.String("server") == "" || c.String("password") == "")) {
-					_ = cli.ShowSubcommandHelp(c)
-					return errors.New("")
-				}
-				if c.String("blockDomainList") != "" && !strings.HasPrefix(c.String("blockDomainList"), "http://") && !strings.HasPrefix(c.String("blockDomainList"), "https://") && !filepath.IsAbs(c.String("blockDomainList")) {
-					return errors.New("--blockDomainList must be with absolute path")
-				}
-				if c.String("bypassDomainList") != "" && !strings.HasPrefix(c.String("bypassDomainList"), "http://") && !strings.HasPrefix(c.String("bypassDomainList"), "https://") && !filepath.IsAbs(c.String("bypassDomainList")) {
-					return errors.New("--bypassDomainList must be with absolute path")
-				}
-				if c.String("bypassCIDR4List") != "" && !strings.HasPrefix(c.String("bypassCIDR4List"), "http://") && !strings.HasPrefix(c.String("bypassCIDR4List"), "https://") && !filepath.IsAbs(c.String("bypassCIDR4List")) {
-					return errors.New("--bypassCIDR4List must be with absolute path")
-				}
-				if c.String("bypassCIDR6List") != "" && !strings.HasPrefix(c.String("bypassCIDR6List"), "http://") && !strings.HasPrefix(c.String("bypassCIDR6List"), "https://") && !filepath.IsAbs(c.String("bypassCIDR6List")) {
-					return errors.New("--bypassCIDR6List must be with absolute path")
-				}
-				if c.String("blockDomainList") != "" || c.String("bypassDomainList") != "" || c.Bool("disableA") || c.Bool("disableAAAA") {
-					p, err := thedns.NewTheDNS(c.String("blockDomainList"), c.String("bypassDomainList"), c.String("dnsForBypass"), c.Bool("disableA"), c.Bool("disableAAAA"), "")
-					if err != nil {
-						return err
-					}
-					p.TouchBrook()
-				}
-				if c.String("bypassCIDR4List") != "" || c.String("bypassCIDR6List") != "" || len(c.StringSlice("bypassGeoIP")) != 0 || c.String("redirectDNS") != "" {
-					p, err := tproxy.NewTproxy(c.String("bypassCIDR4List"), c.String("bypassCIDR6List"), c.StringSlice("bypassGeoIP"), c.Int("tcpTimeout"), c.Int("udpTimeout"), c.String("redirectDNS"))
-					if err != nil {
-						return err
-					}
-					p.TouchBrook()
-				}
-				kind := "server"
-				if strings.HasPrefix(c.String("server"), "ws://") {
-					kind = "wsserver"
-				}
-				if strings.HasPrefix(c.String("server"), "wss://") {
-					kind = "wssserver"
-				}
-				if strings.HasPrefix(c.String("server"), "quic://") {
-					kind = "quicserver"
-				}
-				v := url.Values{}
-				if c.Bool("udpovertcp") {
-					v.Set("udpovertcp", "true")
-				}
-				if c.String("address") != "" {
-					v.Set("address", c.String("address"))
-				}
-				if c.Bool("insecure") {
-					v.Set("insecure", "true")
-				}
-				if c.Bool("withoutBrookProtocol") {
-					v.Set("withoutBrookProtocol", "true")
-				}
-				if c.String("ca") != "" {
-					b, err := os.ReadFile(c.String("ca"))
-					if err != nil {
-						return err
-					}
-					v.Set("ca", string(b))
-				}
-				v.Set("tlsfingerprint", c.String("tlsfingerprint"))
-				v.Set("password", c.String("password"))
-				link := brook.Link(kind, c.String("server"), v)
-				if c.String("link") != "" {
-					link = c.String("link")
-					_, _, v, err := brook.ParseLink(link)
-					if err != nil {
-						return err
-					}
-					if s := v.Get("clientHKDFInfo"); s != "" {
-						brook.ClientHKDFInfo = []byte(s)
-					}
-					if s := v.Get("serverHKDFInfo"); s != "" {
-						brook.ServerHKDFInfo = []byte(s)
-					}
-				}
-				s, err := brook.NewTproxy(c.String("listen"), link, c.Int("tcpTimeout"), c.Int("udpTimeout"))
-				if err != nil {
-					return err
-				}
-				g.Add(&runnergroup.Runner{
-					Start: func() error {
-						if !c.Bool("doNotRunScripts") {
-							s.ClearAutoScripts()
-							if err := s.RunAutoScripts(); err != nil {
-								return err
-							}
-						}
-						return s.ListenAndServe()
-					},
-					Stop: func() error {
-						if !c.Bool("doNotRunScripts") {
-							if err := s.ClearAutoScripts(); err != nil {
-								log.Println(err)
-							}
-						}
-						return s.Shutdown()
-					},
-				})
-				if c.String("dnsListen") != "" {
-					s, err := brook.NewRelayOverBrook(c.String("dnsListen"), link, c.String("dnsForDefault"), c.Int("tcpTimeout"), c.Int("udpTimeout"))
-					if err != nil {
-						return err
-					}
-					s.IsDNS = true
-					g.Add(&runnergroup.Runner{
-						Start: func() error {
-							return s.ListenAndServe()
-						},
-						Stop: func() error {
-							return s.Shutdown()
-						},
-					})
-				}
 				return nil
 			},
 		},
@@ -2901,6 +2462,34 @@ func main() {
 			},
 		},
 		&cli.Command{
+			Name:  "ipcountry",
+			Usage: "Get country of IP",
+			BashComplete: func(c *cli.Context) {
+				l := c.Command.VisibleFlags()
+				for _, v := range l {
+					fmt.Println("--" + v.Names()[0])
+				}
+			},
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:  "ip",
+					Usage: "1.1.1.1",
+				},
+			},
+			Action: func(c *cli.Context) error {
+				ip := net.ParseIP(c.String("ip"))
+				if ip == nil {
+					return errors.New(c.String("ip") + " is not IP")
+				}
+				b := iploc.Country(ip)
+				if b == nil {
+					return errors.New(c.String("ip") + " unknown")
+				}
+				fmt.Println(string(b))
+				return nil
+			},
+		},
+		&cli.Command{
 			Name:  "completion",
 			Usage: "Generate shell completions",
 			Flags: []cli.Flag{
@@ -3047,15 +2636,17 @@ complete -o bashdefault -o default -o nospace -F _cli_bash_autocomplete brook
 			},
 		},
 	}
-	defer df()
 	if os.Getenv("SOCKS5_DEBUG") != "" {
 		socks5.Debug = true
 	}
 	if err := app.Run(os.Args); err != nil {
 		log.Println(err)
+		df()
+		os.Exit(1)
 		return
 	}
 	if len(g.Runners) == 0 {
+		df()
 		return
 	}
 	go func() {
@@ -3064,5 +2655,11 @@ complete -o bashdefault -o default -o nospace -F _cli_bash_autocomplete brook
 		<-sigs
 		g.Done()
 	}()
-	log.Println(g.Wait())
+	if err := g.Wait(); err != nil {
+		log.Println(err)
+		df()
+		os.Exit(1)
+		return
+	}
+	df()
 }
