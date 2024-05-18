@@ -16,12 +16,12 @@ package brook
 
 import (
 	"log"
+	"net"
 	"testing"
 
-	utls "github.com/refraction-networking/utls"
+	"github.com/phuslu/iploc"
 )
 
 func TestTest(t *testing.T) {
-	var ci utls.ClientHelloID
-	log.Println(ci.Client)
+	log.Printf("%#v\n", iploc.Country(net.ParseIP("8.8.8.8")))
 }
